@@ -60,20 +60,23 @@ void ppp_add_cb_on_all_sys_enter2(on_all_sys_enter2_t);
 
 recording_name="test"
 
-# 1) Generate recording we want to analyze
-if not os.path.isfile("test-rr-snp"):
+# 1) Generate recording we want to analyze - Copy the `target/` directory from host into guest
+#if not os.path.isfile(f"{recording_name}-rr-snp"):
+if True: # For now always retake
     print("Taking recording")
     @blocking
     def start():
-        panda.record_cmd("cat /etc/passwd > foo", recording_name=recording_name)
+        panda.record_cmd("target/test", copy_directory="target", recording_name=recording_name)
         panda.end_analysis()
 
     panda.queue_async(start)
     panda.run()
+else:
+    print(f"Using cached recording {recording_name}-rr-snp and {recording_name}-rr-nondet.log")
 
 # 2) Analyze the recording to find all the buffer addresses that go into syscalls
 
-procnames_of_interest = ["cat"]
+procnames_of_interest = ["test"]
 asid_to_procname = {} # asid: procname
 
 # Might have issues if the same process uses the same address multiple times
@@ -84,6 +87,7 @@ argtypes = ffi.typeof("syscall_argtype_t").relements
 def syscall_enter(cpu, pc, call, ctx):
     for arg_idx in range(call.nargs):
         # Debug prints
+        #print(f"Syscall {ffi.string(call.name) if call.name != ffi.NULL else 'unknown'}")
         #type_str = ffi.string(ffi.cast("syscall_argtype_t", call.argt[arg_idx]))
         #print(f"\tArg{arg_idx}: size {call.argsz[arg_idx]}, type {type_str}")
 
@@ -104,9 +108,10 @@ def syscall_enter(cpu, pc, call, ctx):
                 identified_buffers[arg_ptr].append((asid, proc_name, panda.rr_get_guest_instr_count()))
 
 panda.run_replay(recording_name)
-#panda.disable_ppp("syscall_enter") # XXX TODO
 
 print(f"Identified {len(identified_buffers.keys())} buffers")
+if len(identified_buffers.keys()) == 0:
+    raise RuntimeError("Failed to identify any buffers for process(es) {', '.join(procnames_of_interest)}")
 
 # 3) Now we know where the buffers are. Analyze the recording again to identify the last write to each
 
