@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 
 import os
-from ipdb import set_trace as d
 
 from panda import Panda, blocking, ffi
 from panda.x86.helper import *
 
 panda = Panda(generic="x86_64")
+
+# Use syscalls2 to get callbacks whenever we enter any syscall
 panda.load_plugin("syscalls2", {"load-info": True})
+
+# Use OSI to figure out what process is running
 panda.load_plugin("osi")
 panda.load_plugin("osi_linux")
 
@@ -61,12 +64,11 @@ void ppp_add_cb_on_all_sys_enter2(on_all_sys_enter2_t);
 recording_name="test"
 
 # 1) Generate recording we want to analyze - Copy the `target/` directory from host into guest
-#if not os.path.isfile(f"{recording_name}-rr-snp"):
-if True: # For now always retake
+if not os.path.isfile(f"{recording_name}-rr-snp"):
     print("Taking recording")
     @blocking
     def start():
-        panda.record_cmd("target/test", copy_directory="target", recording_name=recording_name)
+        panda.record_cmd("sleep 1s; target/testprog", copy_directory="target", recording_name=recording_name)
         panda.end_analysis()
 
     panda.queue_async(start)
@@ -76,7 +78,7 @@ else:
 
 # 2) Analyze the recording to find all the buffer addresses that go into syscalls
 
-procnames_of_interest = ["test"]
+procnames_of_interest = ["testprog"]
 asid_to_procname = {} # asid: procname
 
 # Might have issues if the same process uses the same address multiple times
@@ -111,14 +113,35 @@ panda.run_replay(recording_name)
 
 print(f"Identified {len(identified_buffers.keys())} buffers")
 if len(identified_buffers.keys()) == 0:
-    raise RuntimeError("Failed to identify any buffers for process(es) {', '.join(procnames_of_interest)}")
+    raise RuntimeError(f"Failed to identify any buffers passed to syscalls for process(es): {', '.join(procnames_of_interest)}")
 
 # 3) Now we know where the buffers are. Analyze the recording again to identify the last write to each
 
+# No longer need syscalls2 callbacks
 panda.unload_plugin("syscalls2")
+
+instr_counts = [hex(truple[0][2]) for truple in identified_buffers.values()]
+panda.load_plugin("memorymap", {"instr_counts": "-".join(instr_counts)}) # Get base address of target
+
+# Turn on memory callbacks so virtual_mem_before_write works
 panda.enable_memcb()
 
-last_write_before = {} # (asid, address, icount_at_use): (write_addr, icount_at_write)
+# update the program counter within basic blocks
+panda.enable_precise_pc()
+
+# XXX: PRI only supports 32-bit linux :( Leaving this disabled
+# Use PRI to map program counters back to line numbers. Note these arguments correspond to the target
+#panda.load_plugin("pri")
+#panda.load_plugin("pri_dwarf", {"proc":"test", "h_debugpath": "./target/", "g_debugpath": "/root/target/" })
+# PRI isn't well supported by the python interface, tell cffi all it needs to know
+#header = """
+#typedef struct { const char *filename; const char *funct_name; unsigned long line_number; } SrcInfo;
+#int pri_get_pc_source_info (CPUState *env, target_ulong pc, SrcInfo *info);
+#"""
+#ffi.cdef(header)
+
+
+last_write_before = {} # (asid, address, icount_at_use): (write_addr, mod_name, mod_base, icount_at_write)
 
 @panda.cb_virt_mem_before_write
 def before_write(cpu, pc, start_addr, size, buf):
@@ -136,17 +159,34 @@ def before_write(cpu, pc, start_addr, size, buf):
                 continue
             if icount_use < write_icount:
                 continue
-            if (asid, addr, icount_use) not in last_write_before.keys():
-                last_write_before[(asid, addr, icount_use)] = (pc, write_icount)
+
+            # Identify what module we're currently in so we can get a relative offset
+            for module in panda.get_mappings(cpu):
+                mod_base = None
+                if addr >= module.base and addr < module.base+module.size: # Then it's in this module
+                    mod_name = ffi.string(module.name).decode("utf8") if module.name != ffi.NULL else '(null)'
+                    mod_base = module.base
+                    break
             else:
-                _, last_write_icount = last_write_before[(asid, addr, icount_use)]
+                print(f"Warning: No loaded module owns address 0x{addr:x}. Skipping")
+                continue
+
+            if (asid, addr, icount_use) not in last_write_before.keys():
+                last_write_before[(asid, addr, icount_use)] = (pc, mod_name, mod_base, write_icount)
+            else:
+                _, _, _, last_write_icount = last_write_before[(asid, addr, icount_use)]
                 if write_icount > last_write_icount: # Replace with new write
-                    last_write_before[(asid, addr, icount_use)] = (pc, write_icount)
+                    last_write_before[(asid, addr, icount_use)] = (pc, mod_name, mod_base, write_icount)
+
+                    # Get source location
+                    #info = ffi.new("SrcInfo*")
+                    #panda.libpanda.pri_get_pc_source_info(cpu, pc, info)
+                    #print(ffi.string(info.filename), ffi.string(info.func_name), info.line_number)
 
 panda.run_replay(recording_name)
 
 # 4) Now we have the last writes to each buffer, print each
-
-for ((asid, addr, _), (write_pc, _)) in last_write_before.items():
+print()
+for ((asid, addr, _), (write_pc, mod_name, mod_base, _)) in last_write_before.items():
     proc_name = asid_to_procname[asid]
-    print(f"Last write to 0x{addr:x} at 0x{write_pc:x} by {proc_name}")
+    print(f"Last write to 0x{addr:x} at 0x{write_pc:x} by process {proc_name}. Written address {mod_name} at offset 0x{addr - mod_base:x}")

@@ -1,4 +1,7 @@
-test: test.c
-	$(CC) $^ -o $@ -g -gdwarf-3
+testprog: test.c
+	$(CC) $^ -o $@ -g3
+
+clean:
+	rm -f testprog
 
 
