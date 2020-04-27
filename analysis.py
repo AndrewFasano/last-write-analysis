@@ -82,20 +82,20 @@ procnames_of_interest = ["testprog"]
 asid_to_procname = {} # asid: procname
 
 # Might have issues if the same process uses the same address multiple times
-identified_buffers = {} # address: [(asid, proc_name, icount_use)]
+identified_buffers = {} # address: [(asid, proc_name, icount_use, syscall_name)]
 
 argtypes = ffi.typeof("syscall_argtype_t").relements
 @panda.ppp("syscalls2", "on_all_sys_enter2")
 def syscall_enter(cpu, pc, call, ctx):
     for arg_idx in range(call.nargs):
         # Debug prints
-        #print(f"Syscall {ffi.string(call.name) if call.name != ffi.NULL else 'unknown'}")
         #type_str = ffi.string(ffi.cast("syscall_argtype_t", call.argt[arg_idx]))
         #print(f"\tArg{arg_idx}: size {call.argsz[arg_idx]}, type {type_str}")
 
-        # Log all pointers passed to syscalls
-        if call.argt[arg_idx] == argtypes['SYSCALL_ARG_PTR']:
-            arg_ptr = int(ffi.cast('uint64_t*', ctx.args)[1]) # Cast to uint64_t's _BEFORE_ we access (weird)
+        # Log all pointers passed to syscalls - strings or poitners to buffers
+        if call.argt[arg_idx] in [argtypes['SYSCALL_ARG_PTR'], argtypes['SYSCALL_ARG_STR']]:
+            arg_ptr = int(ffi.cast('uint64_t*', ctx.args)[arg_idx]) # Cast to uint64_t's _BEFORE_ we access (weird) TODO
+
             asid = panda.current_asid(cpu)
             proc = panda.plugins['osi'].get_current_process(cpu) 
             syscall_name = ffi.string(call.name).decode('utf8') if call.name != ffi.NULL else "unknown"
@@ -107,7 +107,7 @@ def syscall_enter(cpu, pc, call, ctx):
                 print(f"Process: {proc_name} ({ctx.asid}) syscall {syscall_name} with buffer at 0x{arg_ptr:x}")
                 if arg_ptr not in identified_buffers.keys():
                     identified_buffers[arg_ptr] = []
-                identified_buffers[arg_ptr].append((asid, proc_name, panda.rr_get_guest_instr_count()))
+                identified_buffers[arg_ptr].append((asid, proc_name, panda.rr_get_guest_instr_count(), syscall_name))
 
 panda.run_replay(recording_name)
 
@@ -141,7 +141,9 @@ panda.enable_precise_pc()
 #ffi.cdef(header)
 
 
-last_write_before = {} # (asid, address, icount_at_use): (write_addr, mod_name, mod_base, icount_at_write)
+last_write_before = {} # (asid, address, icount_at_use): (icount_at_write, write_addr, mod_name, mod_base, in_kernel)
+
+base_addresses = {} # name (from procnames_of_interest): lowest address loaded at
 
 @panda.cb_virt_mem_before_write
 def before_write(cpu, pc, start_addr, size, buf):
@@ -149,20 +151,35 @@ def before_write(cpu, pc, start_addr, size, buf):
         if addr not in identified_buffers:
             continue
 
+        buf_base = buf+(addr-start_addr)
+        data = ffi.string(ffi.cast('char*', buf_base))
+
         # Find the last instruction (highest icount) that wrote to the buffer,
         # but before the syscall's icount
         write_icount = panda.rr_get_guest_instr_count()
 
         asid = panda.current_asid(cpu)
-        for (old_asid, proc_name, icount_use) in identified_buffers[addr]:
+        for (old_asid, proc_name, icount_use, _) in identified_buffers[addr]:
             if old_asid != asid:
                 continue
             if icount_use < write_icount:
                 continue
 
+            in_kernel = panda.in_kernel(cpu)
+
             # Identify what module we're currently in so we can get a relative offset
             for module in panda.get_mappings(cpu):
                 mod_base = None
+                mod_name = ffi.string(module.name).decode("utf8") if module.name != ffi.NULL else '(null)'
+
+                if mod_name in procnames_of_interest:
+                    if mod_name not in base_addresses or module.base < base_addresses[mod_name]:
+                        base_addresses[mod_name] = module.base
+
+
+                # Debug: print memory map at each write we care about
+                #print(f"0x{module.base:012x} - 0x{module.base+module.size:012x}: {mod_name}")
+
                 if addr >= module.base and addr < module.base+module.size: # Then it's in this module
                     mod_name = ffi.string(module.name).decode("utf8") if module.name != ffi.NULL else '(null)'
                     mod_base = module.base
@@ -171,12 +188,20 @@ def before_write(cpu, pc, start_addr, size, buf):
                 print(f"Warning: No loaded module owns address 0x{addr:x}. Skipping")
                 continue
 
+            # Identify where PC is at time of write
+            '''
+            for module in panda.get_mappings(cpu):
+                if pc >= module.base and pc < module.base+module.size: # Then it's in this module
+                    name = ffi.string(module.name).decode("utf8") if module.name != ffi.NULL else '(null)'
+                    print(f"PC 0x{pc:x} is in {name} offset: 0x{pc-module.base:x}")
+            '''
+
             if (asid, addr, icount_use) not in last_write_before.keys():
-                last_write_before[(asid, addr, icount_use)] = (pc, mod_name, mod_base, write_icount)
+                last_write_before[(asid, addr, icount_use)] = (write_icount, pc, mod_name, mod_base, in_kernel)
             else:
-                _, _, _, last_write_icount = last_write_before[(asid, addr, icount_use)]
+                last_write_icount = last_write_before[(asid, addr, icount_use)][0]
                 if write_icount > last_write_icount: # Replace with new write
-                    last_write_before[(asid, addr, icount_use)] = (pc, mod_name, mod_base, write_icount)
+                    last_write_before[(asid, addr, icount_use)] = (write_icount, pc, mod_name, mod_base, in_kernel)
 
                     # Get source location
                     #info = ffi.new("SrcInfo*")
@@ -186,7 +211,15 @@ def before_write(cpu, pc, start_addr, size, buf):
 panda.run_replay(recording_name)
 
 # 4) Now we have the last writes to each buffer, print each
+# XXX: some of these relative addresses look crazy
 print()
-for ((asid, addr, _), (write_pc, mod_name, mod_base, _)) in last_write_before.items():
-    proc_name = asid_to_procname[asid]
-    print(f"Last write to 0x{addr:x} at 0x{write_pc:x} by process {proc_name}. Written address {mod_name} at offset 0x{addr - mod_base:x}")
+for ((asid, addr, _), (_, write_pc, mod_name, mod_base, in_kernel)) in last_write_before.items():
+    proc_name, syscall_name = [(buf[1], buf[3]) for buf in identified_buffers[addr] if buf[0] == asid][0]
+    print(f"{syscall_name} got data from 0x{addr:x} => {mod_name}+0x{addr-mod_base:x}")
+    if in_kernel:
+        print("\tData was written by the kernel")
+    elif proc_name in base_addresses:
+        #print(f"\tWritten by {proc_name} (base 0x{base_addresses[proc_name]:x}). Relative PC: 0x{write_pc - base_addresses[proc_name]:x}")
+        print(f"\tWritten by {proc_name} (base 0x{base_addresses[proc_name]:x}). PC at write 0x{write_pc:x}")
+    else:
+        print(f"\tWritten by {proc_name}")
